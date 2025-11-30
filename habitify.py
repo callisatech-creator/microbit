@@ -3,9 +3,10 @@ import time
 import threading
 import queue
 import datetime
+from typing import Optional
 
-import serial  # pip install pyserial
-import requests  # pip install requests
+import serial          # pip install pyserial
+import requests        # pip install requests
 import tkinter as tk
 
 # ====== CONFIG ======
@@ -19,7 +20,8 @@ event_queue = queue.Queue()
 # ----- Habitify API config -----
 HABITIFY_BASE_URL = "https://api.habitify.me"
 HABITIFY_API_KEY = "5e18019ff199aafbc6ccf1f3faa93607f6823ba5c3858a580e05eb3fc0b98c95af74008a9b630a7ad7f915065e2a7eeb"
-HABITIFY_HABIT_ID = "D3F6A59D-80F6-4E6D-B28A-89E52E8DE5B1"
+HABITIFY_HABIT_ID = "D3F6A59D-80F6-4E6D-B28A-89E52E8DE5B1"  # Study Focus Session
+HABITIFY_UNIT_TYPE = "min"   # assuming the habit goal is in minutes
 
 
 def habitify_headers():
@@ -29,7 +31,8 @@ def habitify_headers():
     }
 
 
-def habitify_create_action():
+# ---------- Habitify: Actions (works like your second script) ----------
+def habitify_create_action() -> Optional[str]:
     """
     Create a Habitify action for the configured habit.
     Returns the action_id (string) if present, or None if Habitify
@@ -52,7 +55,6 @@ def habitify_create_action():
         resp = requests.post(url, json=payload, headers=habitify_headers(), timeout=10)
         print("[HABITIFY] Create action status:", resp.status_code)
 
-        # Any 200/201 is a success for our purposes
         if resp.status_code not in (200, 201):
             print("[HABITIFY] Error creating action:", resp.text)
             return None
@@ -70,7 +72,7 @@ def habitify_create_action():
             print("[HABITIFY] Created action with id:", action_id)
             return action_id
         else:
-            # This matches what you're seeing: "data": null
+            # Your previous behavior: "data": null → still success
             print("[HABITIFY] Action created (no id returned, that's OK).")
             return None
 
@@ -79,7 +81,7 @@ def habitify_create_action():
         return None
 
 
-def habitify_complete_action(action_id):
+def habitify_complete_action(action_id: Optional[str]):
     """
     Mark an existing Habitify action as Done (status = 1).
     """
@@ -102,6 +104,36 @@ def habitify_complete_action(action_id):
         print("[HABITIFY] Exception while completing action:", e)
 
 
+# ---------- Habitify: Logs (optional, to record minutes) ----------
+def habitify_add_log(minutes_value: float, end_time: Optional[datetime.datetime] = None):
+    """
+    Add a log to the Study Focus Session habit in Habitify.
+    - minutes_value: how long this focus session lasted (in minutes)
+    - end_time: when the session ended (datetime with timezone)
+    """
+    if end_time is None:
+        end_time = datetime.datetime.now().astimezone()
+
+    # Habitify expects full ISO with offset: YYYY-MM-DDThh:mm:ss±hh:mm
+    target_date = end_time.replace(microsecond=0).isoformat()
+    print("[HABITIFY] Using target_date:", target_date)
+    print("[HABITIFY] Logging minutes:", minutes_value)
+
+    url = f"{HABITIFY_BASE_URL}/logs/{HABITIFY_HABIT_ID}"
+    payload = {
+        "unit_type": HABITIFY_UNIT_TYPE,     # "min"
+        "value": minutes_value,              # e.g., 23.5
+        "target_date": target_date
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=habitify_headers(), timeout=10)
+        print("[HABITIFY] Add log status:", resp.status_code)
+        print("[HABITIFY] Response:", resp.text)
+    except Exception as e:
+        print("[HABITIFY] Error while adding log:", e)
+
+
 # ---------- Helper: interpret noisy serial lines ----------
 def interpret_event(line: str):
     """
@@ -117,8 +149,8 @@ def interpret_event(line: str):
     if "FOCUS" in s and ("START" in s or "STRT" in s or "SART" in s or "STAT" in s or "TART" in s):
         return "START_FOCUS"
 
-    # END_FOCUS variants: look for END + FOCUS or STOP + FOCUS
-    if "FOCUS" in s and ("END" in s or "STOP" in s):
+    # END_FOCUS variants: look for END + FOCUS or STOP + FOCUS or FINISH + FOCUS
+    if "FOCUS" in s and ("END" in s or "STOP" in s or "FINISH" in s):
         return "END_FOCUS"
 
     # Sudden movement variants
@@ -172,8 +204,11 @@ class FocusApp:
         self.duration = FOCUS_MINUTES * 60
         self.remaining = 0
 
-        # Track Habitify action id for this session
-        self.current_action_id = None
+        # For Habitify actions
+        self.current_action_id: Optional[str] = None
+
+        # For accurate session timing
+        self.session_start_time: Optional[datetime.datetime] = None
 
         # UI widgets
         self.time_label = tk.Label(
@@ -224,13 +259,22 @@ class FocusApp:
 
     def start_focus(self):
         print("[GUI] start_focus() called")
+
+        # If already active, ignore extra STARTs to avoid overlapping sessions
+        if self.focus_active:
+            return
+
         self.focus_active = True
         self.remaining = self.duration
+
+        # Mark real start time
+        self.session_start_time = datetime.datetime.now().astimezone()
+
         self.popup_window()
         self.status_label.config(text="FOCUS ON", fg="#2ecc71")
         self.warning_label.config(text="")
 
-        # Create a Habitify action when session starts
+        # Create a Habitify action when session starts (like your working code)
         self.current_action_id = habitify_create_action()
 
         self.update_timer()
@@ -239,13 +283,28 @@ class FocusApp:
         print("[GUI] end_focus() called")
         if not self.focus_active:
             return
+
         self.focus_active = False
         self.status_label.config(text="FOCUS STOPPED", fg="#e74c3c")
+
+        end_time = datetime.datetime.now().astimezone()
+
+        # Calculate elapsed time for logging
+        if self.session_start_time is not None:
+            elapsed_seconds = (end_time - self.session_start_time).total_seconds()
+            minutes_value = max(elapsed_seconds / 60.0, 0.1)  # avoid zero
+            print(f"[SESSION] Elapsed seconds: {elapsed_seconds}, minutes: {minutes_value}")
+            habitify_add_log(minutes_value, end_time=end_time)
+        else:
+            print("[SESSION] No session_start_time recorded; skipping log minutes.")
 
         # Mark Habitify action as done (if we have one)
         if self.current_action_id:
             habitify_complete_action(self.current_action_id)
             self.current_action_id = None
+
+        # Reset for next session
+        self.session_start_time = None
 
     def sudden_move(self):
         print("[GUI] sudden_move() called")
@@ -265,10 +324,23 @@ class FocusApp:
             self.status_label.config(text="SESSION COMPLETE", fg="#f1c40f")
             self.warning_label.config(text="")
 
-            # Session finished naturally → complete Habitify action
+            end_time = datetime.datetime.now().astimezone()
+
+            # Compute elapsed based on session_start_time
+            if self.session_start_time is not None:
+                elapsed_seconds = (end_time - self.session_start_time).total_seconds()
+                minutes_value = max(elapsed_seconds / 60.0, 0.1)
+                print(f"[SESSION] Auto-complete. Elapsed seconds: {elapsed_seconds}, minutes: {minutes_value}")
+                habitify_add_log(minutes_value, end_time=end_time)
+            else:
+                print("[SESSION] Auto-complete reached but no session_start_time.")
+
+            # Complete Habitify action if present
             if self.current_action_id:
                 habitify_complete_action(self.current_action_id)
                 self.current_action_id = None
+
+            self.session_start_time = None
             return
 
         self.remaining -= 1
@@ -300,3 +372,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
