@@ -4,24 +4,30 @@ import threading
 import queue
 from datetime import datetime
 from typing import Optional
+import platform
+import subprocess
 
 import serial          # pip install pyserial
 import requests        # pip install requests
 import tkinter as tk
 
 # ====== CONFIG ======
-PORT = "/dev/cu.usbmodem102"   # <-- CHANGE if your micro:bit is on a different port
+# On Mac, your micro:bit port will look like /dev/cu.usbmodemXXX.
+# Adjust this if it changes.
+PORT = "/dev/cu.usbmodem102"
 BAUDRATE = 115200
 FOCUS_MINUTES = 25             # 25-minute focus session
 # FOCUS_MINUTES = 1            # uncomment for quick tests
-HABITIFY_UNIT_TYPE = "rep"
 
 event_queue = queue.Queue()
+IS_MAC = (platform.system() == "Darwin")
 
 # ----- Habitify API config -----
 HABITIFY_BASE_URL = "https://api.habitify.me"
 HABITIFY_API_KEY = "5e18019ff199aafbc6ccf1f3faa93607f6823ba5c3858a580e05eb3fc0b98c95af74008a9b630a7ad7f915065e2a7eeb"
 HABITIFY_HABIT_ID = "35478B05-4E96-41C8-B35A-6D8CA6579B8B"  # Study Focus Session
+# For a habit that is "5 times per day", Habitify uses unit_type = "rep"
+HABITIFY_UNIT_TYPE = "rep"
 
 
 def habitify_headers():
@@ -41,8 +47,8 @@ def habitify_create_action() -> Optional[str]:
     url = f"{HABITIFY_BASE_URL}/actions/{HABITIFY_HABIT_ID}"
 
     # Habitify wants: YYYY-MM-DDThh:mm:ss±hh:mm  (with timezone offset)
-    now_local = datetime.now().astimezone()                 # local time w/ tzinfo
-    remind_at = now_local.replace(microsecond=0).isoformat()  # e.g. 2025-11-30T14:12:03-05:00
+    now_local = datetime.now().astimezone()
+    remind_at = now_local.replace(microsecond=0).isoformat()
 
     print("[HABITIFY] Using remind_at:", remind_at)
 
@@ -72,7 +78,6 @@ def habitify_create_action() -> Optional[str]:
             print("[HABITIFY] Created action with id:", action_id)
             return action_id
         else:
-            # "data": null is still success for our purposes
             print("[HABITIFY] Action created (no id returned, that's OK).")
             return None
 
@@ -104,16 +109,12 @@ def habitify_complete_action(action_id: Optional[str]):
         print("[HABITIFY] Exception while completing action:", e)
 
 
-# ---------- Habitify: Logs (record minutes for the session) ----------
-def habitify_add_log(minutes_value: float, end_time: Optional[datetime] = None):
+# ---------- Habitify: Logs (record reps for the session) ----------
+def habitify_add_log(value: float, end_time: Optional[datetime] = None):
     """
     Add a log to the Study Focus Session habit in Habitify.
-
-    For this habit, we treat each focus session as 1 'rep'
-    towards a 5-times-per-day goal, so we log:
-      - value = 1
-      - unit_type = HABITIFY_UNIT_TYPE ('rep')
-      - target_date = when the session ended
+    - value: number of reps (we just log 1 rep per finished session)
+    - end_time: when the session ended (datetime with timezone)
     """
     if end_time is None:
         end_time = datetime.now().astimezone()
@@ -121,14 +122,14 @@ def habitify_add_log(minutes_value: float, end_time: Optional[datetime] = None):
     # Habitify expects full ISO with offset: YYYY-MM-DDThh:mm:ss±hh:mm
     target_date = end_time.replace(microsecond=0).isoformat()
     print("[HABITIFY] Using target_date:", target_date)
-    print("[HABITIFY] Logging 1", HABITIFY_UNIT_TYPE)
+    print("[HABITIFY] Logging value:", value, "unit_type:", HABITIFY_UNIT_TYPE)
 
     url = f"{HABITIFY_BASE_URL}/logs/{HABITIFY_HABIT_ID}"
     headers = habitify_headers()
 
     payload = {
-        "unit_type": HABITIFY_UNIT_TYPE,  # ✅ REQUIRED
-        "value": 1,                       # ✅ one completed focus session
+        "value": value,                  # e.g., 1
+        "unit_type": HABITIFY_UNIT_TYPE, # "rep" for times-per-day habits
         "target_date": target_date
     }
 
@@ -214,6 +215,10 @@ class FocusApp:
         # For accurate session timing
         self.session_start_time: Optional[datetime] = None
 
+        # Focus mode enforcement
+        self.focus_enforcer_thread: Optional[threading.Thread] = None
+        self.focus_enforcer_running: bool = False
+
         # UI widgets
         self.time_label = tk.Label(
             root,
@@ -254,6 +259,84 @@ class FocusApp:
         # Start polling for events
         self.root.after(200, self.poll_events)
 
+    # ---------- Desktop focus / app hiding ----------
+    def enter_desktop_focus(self):
+        if not IS_MAC:
+            print("[FOCUS] Desktop focus mode not supported on this OS.")
+            return
+
+        print("[FOCUS] Entering macOS focus mode…")
+
+        # Optional: run your macOS Shortcut to toggle a Focus mode
+        try:
+            subprocess.run(
+                ["shortcuts", "run", "Microbit Focus On"],
+                check=False
+            )
+            print("[FOCUS] Running macOS Shortcut: 'Microbit Focus On'")
+        except FileNotFoundError:
+            print("[FOCUS] 'shortcuts' CLI not found; skipping Shortcut run.")
+
+        # Start enforcement thread to hide non-allowed apps
+        if not self.focus_enforcer_running:
+            self.focus_enforcer_running = True
+            self.focus_enforcer_thread = threading.Thread(
+                target=self.focus_enforcer_loop,
+                daemon=True
+            )
+            self.focus_enforcer_thread.start()
+
+    def leave_desktop_focus(self):
+        if not IS_MAC:
+            return
+
+        print("[FOCUS] Leaving macOS focus mode…")
+        try:
+            subprocess.run(
+                ["shortcuts", "run", "Microbit Focus Off"],
+                check=False
+            )
+            print("[FOCUS] Running macOS Shortcut: 'Microbit Focus Off'")
+        except FileNotFoundError:
+            print("[FOCUS] 'shortcuts' CLI not found; skipping Shortcut run.")
+
+        # Stop enforcement loop
+        self.focus_enforcer_running = False
+
+    def focus_enforcer_loop(self):
+        """
+        Periodically hide all non-allowed apps using AppleScript with
+        'set visible of process ... to false' instead of 'hide'.
+        """
+        # IMPORTANT: update allowedApps if you want more apps allowed.
+        applescript = r'''
+tell application "System Events"
+    set allowedApps to {"Google Chrome", "Microsoft Word", "Terminal", "Python", "python3"}
+    set frontApps to every application process whose background only is false
+    repeat with proc in frontApps
+        set appName to name of proc
+        if allowedApps does not contain appName then
+            try
+                set visible of proc to false
+            end try
+        end if
+    end repeat
+end tell
+'''.strip("\n")
+
+        print("[FOCUS] Enforcer loop started.")
+        while self.focus_enforcer_running:
+            try:
+                subprocess.run(
+                    ["osascript", "-e", applescript],
+                    check=False
+                )
+            except Exception as e:
+                print("[FOCUS] Error running AppleScript:", e)
+            time.sleep(5)
+        print("[FOCUS] Enforcer loop stopped.")
+
+    # ---------- UI helpers ----------
     def popup_window(self):
         """Always show and bring the window to front."""
         self.root.deiconify()
@@ -261,6 +344,7 @@ class FocusApp:
         self.root.attributes("-topmost", True)
         self.root.after(1500, lambda: self.root.attributes("-topmost", False))
 
+    # ---------- Focus session control ----------
     def start_focus(self):
         print("[GUI] start_focus() called")
 
@@ -280,6 +364,9 @@ class FocusApp:
         # Create a Habitify action when session starts
         self.current_action_id = habitify_create_action()
 
+        # Enter macOS focus mode + hide other apps (on Mac)
+        self.enter_desktop_focus()
+
         self.update_timer()
 
     def end_focus(self):
@@ -292,19 +379,22 @@ class FocusApp:
 
         end_time = datetime.now().astimezone()
 
-        # Calculate elapsed time and log it
+        # For Habitify "5 times per day" style habit, we just log 1 rep per session.
         if self.session_start_time is not None:
             elapsed_seconds = (end_time - self.session_start_time).total_seconds()
-            minutes_value = max(elapsed_seconds / 60.0, 0.1)  # avoid zero
+            minutes_value = elapsed_seconds / 60.0
             print(f"[SESSION] Elapsed seconds: {elapsed_seconds}, minutes: {minutes_value}")
-            habitify_add_log(minutes_value, end_time=end_time)
+            habitify_add_log(1.0, end_time=end_time)  # always log 1 rep
         else:
-            print("[SESSION] No session_start_time recorded; skipping log minutes.")
+            print("[SESSION] No session_start_time recorded; skipping log reps.")
 
         # Mark Habitify action as done (if we have one)
         if self.current_action_id:
             habitify_complete_action(self.current_action_id)
             self.current_action_id = None
+
+        # Leave macOS focus mode
+        self.leave_desktop_focus()
 
         # Reset for next session
         self.session_start_time = None
@@ -331,9 +421,9 @@ class FocusApp:
 
             if self.session_start_time is not None:
                 elapsed_seconds = (end_time - self.session_start_time).total_seconds()
-                minutes_value = max(elapsed_seconds / 60.0, 0.1)
+                minutes_value = elapsed_seconds / 60.0
                 print(f"[SESSION] Auto-complete. Elapsed seconds: {elapsed_seconds}, minutes: {minutes_value}")
-                habitify_add_log(minutes_value, end_time=end_time)
+                habitify_add_log(1.0, end_time=end_time)  # 1 rep for full session
             else:
                 print("[SESSION] Auto-complete reached but no session_start_time.")
 
@@ -341,6 +431,7 @@ class FocusApp:
                 habitify_complete_action(self.current_action_id)
                 self.current_action_id = None
 
+            self.leave_desktop_focus()
             self.session_start_time = None
             return
 
