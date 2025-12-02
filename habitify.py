@@ -2,7 +2,7 @@ import sys
 import time
 import threading
 import queue
-import datetime
+from datetime import datetime
 from typing import Optional
 
 import serial          # pip install pyserial
@@ -10,18 +10,18 @@ import requests        # pip install requests
 import tkinter as tk
 
 # ====== CONFIG ======
-PORT = "COM3"          # <-- CHANGE THIS if your micro:bit is on a different COM port
+PORT = "/dev/cu.usbmodem102"   # <-- CHANGE if your micro:bit is on a different port
 BAUDRATE = 115200
-FOCUS_MINUTES = 25     # 25-minute focus session
-# FOCUS_MINUTES = 1    # uncomment for quick tests
+FOCUS_MINUTES = 25             # 25-minute focus session
+# FOCUS_MINUTES = 1            # uncomment for quick tests
+HABITIFY_UNIT_TYPE = "rep"
 
 event_queue = queue.Queue()
 
 # ----- Habitify API config -----
 HABITIFY_BASE_URL = "https://api.habitify.me"
 HABITIFY_API_KEY = "5e18019ff199aafbc6ccf1f3faa93607f6823ba5c3858a580e05eb3fc0b98c95af74008a9b630a7ad7f915065e2a7eeb"
-HABITIFY_HABIT_ID = "D3F6A59D-80F6-4E6D-B28A-89E52E8DE5B1"  # Study Focus Session
-HABITIFY_UNIT_TYPE = "min"   # assuming the habit goal is in minutes
+HABITIFY_HABIT_ID = "35478B05-4E96-41C8-B35A-6D8CA6579B8B"  # Study Focus Session
 
 
 def habitify_headers():
@@ -31,7 +31,7 @@ def habitify_headers():
     }
 
 
-# ---------- Habitify: Actions (works like your second script) ----------
+# ---------- Habitify: Actions ----------
 def habitify_create_action() -> Optional[str]:
     """
     Create a Habitify action for the configured habit.
@@ -41,7 +41,7 @@ def habitify_create_action() -> Optional[str]:
     url = f"{HABITIFY_BASE_URL}/actions/{HABITIFY_HABIT_ID}"
 
     # Habitify wants: YYYY-MM-DDThh:mm:ss±hh:mm  (with timezone offset)
-    now_local = datetime.datetime.now().astimezone()  # local time w/ tzinfo
+    now_local = datetime.now().astimezone()                 # local time w/ tzinfo
     remind_at = now_local.replace(microsecond=0).isoformat()  # e.g. 2025-11-30T14:12:03-05:00
 
     print("[HABITIFY] Using remind_at:", remind_at)
@@ -72,7 +72,7 @@ def habitify_create_action() -> Optional[str]:
             print("[HABITIFY] Created action with id:", action_id)
             return action_id
         else:
-            # Your previous behavior: "data": null → still success
+            # "data": null is still success for our purposes
             print("[HABITIFY] Action created (no id returned, that's OK).")
             return None
 
@@ -104,30 +104,36 @@ def habitify_complete_action(action_id: Optional[str]):
         print("[HABITIFY] Exception while completing action:", e)
 
 
-# ---------- Habitify: Logs (optional, to record minutes) ----------
-def habitify_add_log(minutes_value: float, end_time: Optional[datetime.datetime] = None):
+# ---------- Habitify: Logs (record minutes for the session) ----------
+def habitify_add_log(minutes_value: float, end_time: Optional[datetime] = None):
     """
     Add a log to the Study Focus Session habit in Habitify.
-    - minutes_value: how long this focus session lasted (in minutes)
-    - end_time: when the session ended (datetime with timezone)
+
+    For this habit, we treat each focus session as 1 'rep'
+    towards a 5-times-per-day goal, so we log:
+      - value = 1
+      - unit_type = HABITIFY_UNIT_TYPE ('rep')
+      - target_date = when the session ended
     """
     if end_time is None:
-        end_time = datetime.datetime.now().astimezone()
+        end_time = datetime.now().astimezone()
 
     # Habitify expects full ISO with offset: YYYY-MM-DDThh:mm:ss±hh:mm
     target_date = end_time.replace(microsecond=0).isoformat()
     print("[HABITIFY] Using target_date:", target_date)
-    print("[HABITIFY] Logging minutes:", minutes_value)
+    print("[HABITIFY] Logging 1", HABITIFY_UNIT_TYPE)
 
     url = f"{HABITIFY_BASE_URL}/logs/{HABITIFY_HABIT_ID}"
+    headers = habitify_headers()
+
     payload = {
-        "unit_type": HABITIFY_UNIT_TYPE,     # "min"
-        "value": minutes_value,              # e.g., 23.5
+        "unit_type": HABITIFY_UNIT_TYPE,  # ✅ REQUIRED
+        "value": 1,                       # ✅ one completed focus session
         "target_date": target_date
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=habitify_headers(), timeout=10)
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
         print("[HABITIFY] Add log status:", resp.status_code)
         print("[HABITIFY] Response:", resp.text)
     except Exception as e:
@@ -142,14 +148,13 @@ def interpret_event(line: str):
     This makes things robust to small typos like STAT_FOCUS, SART_FOCUS, etc.
     """
     s = line.strip().upper()
-    # Debug:
     print("[INTERPRET]", repr(s))
 
-    # START_FOCUS variants: look for both START-ish and FOCUS
+    # START_FOCUS variants
     if "FOCUS" in s and ("START" in s or "STRT" in s or "SART" in s or "STAT" in s or "TART" in s):
         return "START_FOCUS"
 
-    # END_FOCUS variants: look for END + FOCUS or STOP + FOCUS or FINISH + FOCUS
+    # END_FOCUS variants
     if "FOCUS" in s and ("END" in s or "STOP" in s or "FINISH" in s):
         return "END_FOCUS"
 
@@ -157,7 +162,6 @@ def interpret_event(line: str):
     if "MOVE" in s or "MOTION" in s or "SHAKE" in s:
         return "SUDDEN_MOVE"
 
-    # If we can't confidently interpret it, ignore
     return None
 
 
@@ -208,7 +212,7 @@ class FocusApp:
         self.current_action_id: Optional[str] = None
 
         # For accurate session timing
-        self.session_start_time: Optional[datetime.datetime] = None
+        self.session_start_time: Optional[datetime] = None
 
         # UI widgets
         self.time_label = tk.Label(
@@ -260,7 +264,6 @@ class FocusApp:
     def start_focus(self):
         print("[GUI] start_focus() called")
 
-        # If already active, ignore extra STARTs to avoid overlapping sessions
         if self.focus_active:
             return
 
@@ -268,13 +271,13 @@ class FocusApp:
         self.remaining = self.duration
 
         # Mark real start time
-        self.session_start_time = datetime.datetime.now().astimezone()
+        self.session_start_time = datetime.now().astimezone()
 
         self.popup_window()
         self.status_label.config(text="FOCUS ON", fg="#2ecc71")
         self.warning_label.config(text="")
 
-        # Create a Habitify action when session starts (like your working code)
+        # Create a Habitify action when session starts
         self.current_action_id = habitify_create_action()
 
         self.update_timer()
@@ -287,9 +290,9 @@ class FocusApp:
         self.focus_active = False
         self.status_label.config(text="FOCUS STOPPED", fg="#e74c3c")
 
-        end_time = datetime.datetime.now().astimezone()
+        end_time = datetime.now().astimezone()
 
-        # Calculate elapsed time for logging
+        # Calculate elapsed time and log it
         if self.session_start_time is not None:
             elapsed_seconds = (end_time - self.session_start_time).total_seconds()
             minutes_value = max(elapsed_seconds / 60.0, 0.1)  # avoid zero
@@ -324,9 +327,8 @@ class FocusApp:
             self.status_label.config(text="SESSION COMPLETE", fg="#f1c40f")
             self.warning_label.config(text="")
 
-            end_time = datetime.datetime.now().astimezone()
+            end_time = datetime.now().astimezone()
 
-            # Compute elapsed based on session_start_time
             if self.session_start_time is not None:
                 elapsed_seconds = (end_time - self.session_start_time).total_seconds()
                 minutes_value = max(elapsed_seconds / 60.0, 0.1)
@@ -335,7 +337,6 @@ class FocusApp:
             else:
                 print("[SESSION] Auto-complete reached but no session_start_time.")
 
-            # Complete Habitify action if present
             if self.current_action_id:
                 habitify_complete_action(self.current_action_id)
                 self.current_action_id = None
@@ -372,4 +373,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
